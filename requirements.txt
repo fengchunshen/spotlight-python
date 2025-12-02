@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+orjson
+
+langchain-core
+langgraph
+langchain-openai
+httpx
+
+python-dotenv
+loguru
+
