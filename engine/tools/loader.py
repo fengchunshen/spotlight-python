@@ -30,7 +30,7 @@ def build_tools_from_runtime(
                 return await execute_http_tool(_cfg, args, _vault, _tid)
             
             tools[cfg.name] = _http_runner
-            logger.info(f"Loaded HTTP tool: {cfg.name}")
+            logger.info(f"已加载 HTTP 工具: {cfg.name}")
 
         elif cfg.type == "NATIVE":
             # TODO: 通过 execution_config["class"] 反射加载 BaseNativeTool 子类
@@ -38,11 +38,11 @@ def build_tools_from_runtime(
                 raise NotImplementedError(f"NATIVE tool {_cfg.name} not implemented yet")
             
             tools[cfg.name] = _not_impl
-            logger.warning(f"NATIVE tool {cfg.name} registered but not implemented")
+            logger.warning(f"NATIVE 工具 {cfg.name} 已注册但尚未实现")
         
         else:
-            logger.warning(f"Unknown tool type: {cfg.type} for tool {cfg.name}")
+            logger.warning(f"未知的工具类型 {cfg.type}，工具名为 {cfg.name}")
 
-    logger.info(f"Built {len(tools)} tools from runtime config")
+    logger.info(f"已根据运行时配置构建 {len(tools)} 个工具")
     return tools
 

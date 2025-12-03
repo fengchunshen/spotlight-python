@@ -282,14 +282,14 @@ async def run_workflow(payload: Payload):
         try:
             # 1. 验证 workflow_id
             workflow_id = payload.task_meta.workflow_id
-            logger.info(f"Starting workflow: {workflow_id}")
+            logger.info(f"开始执行工作流: {workflow_id}")
             
             # 发送初始思考事件
             yield format_tool_thinking("正在初始化工作流...", trace_id)
             
             # 身份问答拦截
             if is_identity_query(payload.input.messages):
-                logger.info("Identity query detected, returning canned response")
+                logger.info("检测到身份查询，返回预置回复")
                 yield format_message_chunk(IDENTITY_RESPONSE, trace_id)
                 yield format_done(
                     usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -300,12 +300,12 @@ async def run_workflow(payload: Payload):
 
             # 2. 构建 LLM
             model_cfg = payload.runtime_config.model
-            logger.info("Building LLM client")
+            logger.info("正在构建 LLM 客户端")
             yield format_tool_thinking("正在连接模型服务...", trace_id)
             llm = build_llm(model_cfg)
             
             # 3. 构建工具集
-            logger.info(f"Loading {len(payload.runtime_config.tools)} tools")
+            logger.info(f"正在加载 {len(payload.runtime_config.tools)} 个工具")
             yield format_tool_thinking("正在加载工具...", trace_id)
             tools = build_tools_from_runtime(
                 payload.runtime_config.tools,
@@ -317,12 +317,12 @@ async def run_workflow(payload: Payload):
             try:
                 builder = get_workflow_builder(workflow_id)
             except ValueError as e:
-                logger.error(f"Invalid workflow_id: {workflow_id}")
+                logger.error(f"非法的 workflow_id: {workflow_id}")
                 yield format_error(400, str(e), trace_id)
                 return
             
             # 5. 构建工作流图
-            logger.info("Building workflow graph")
+            logger.info("正在构建工作流图")
             yield format_tool_thinking("正在构建工作流...", trace_id)
             graph = builder(llm=llm)
             
@@ -332,7 +332,7 @@ async def run_workflow(payload: Payload):
             }
             
             # 7. 执行工作流（流式）
-            logger.info("Executing workflow (streaming)")
+            logger.info("以流式模式执行工作流")
             yield format_tool_thinking("正在执行工作流...", trace_id)
             
             # 初始化 token usage 统计
@@ -417,14 +417,14 @@ async def run_workflow(payload: Payload):
                     
                     except Exception as e:
                         # 记录事件处理错误，但不中断整个流
-                        logger.warning(f"Error processing event {event_name}: {str(e)}")
+                        logger.warning(f"处理事件 {event_name} 时出错: {str(e)}")
                         # 记录错误但不抛出，继续处理后续事件
                         stream_error = e
                         continue
             
             except Exception as stream_exception:
                 # 流式执行过程中的严重错误
-                logger.error(f"Stream execution error: {str(stream_exception)}")
+                logger.error(f"流式执行出现异常: {str(stream_exception)}")
                 logger.error(traceback.format_exc())
                 stream_error = stream_exception
                 # 如果已经有部分内容输出，先输出已累积的内容
@@ -434,22 +434,22 @@ async def run_workflow(payload: Payload):
             # 8. 输出完成事件（即使有错误也要输出，确保前端能收到完成信号）
             if stream_error:
                 # 如果有流式错误，记录但继续完成流程
-                logger.warning(f"Workflow completed with errors, total_tokens: {usage_data['total_tokens']}")
+                logger.warning(f"工作流执行结束但存在错误，总 tokens: {usage_data['total_tokens']}")
             else:
-                logger.info(f"Workflow completed, total_tokens: {usage_data['total_tokens']}")
+                logger.info(f"工作流执行完成，总 tokens: {usage_data['total_tokens']}")
             
             # 如果无法提取 usage，使用默认值（已在初始化时设置）
             # 确保 usage_data 始终有效
             if usage_data["total_tokens"] == 0 and accumulated_content:
                 # 如果无法获取准确的 token 数，但确实有输出，记录警告
-                logger.warning("Unable to extract token usage from LLM response, using default values")
+                logger.warning("无法从模型响应中提取 token 用量，使用默认值")
             
             yield format_done(usage=usage_data, finish_reason=finish_reason, trace_id=trace_id)
-            logger.info("Workflow execution completed successfully")
+            logger.info("工作流执行成功结束")
             
         except Exception as e:
             # 捕获所有异常并转换为 SSE error 事件
-            logger.error(f"Workflow execution failed: {str(e)}")
+            logger.error(f"工作流执行失败: {str(e)}")
             logger.error(traceback.format_exc())
             
             # 返回安全的错误消息（不泄露内部实现细节）

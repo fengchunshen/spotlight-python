@@ -46,10 +46,10 @@ async def execute_http_tool(
         target_header = auth_cfg.get("target")
         if source_key and target_header and source_key in vault:
             headers[target_header] = vault[source_key]
-            logger.info(f"HTTP tool {tool_cfg.name}: injected auth header {target_header}")
+            logger.info(f"HTTP 工具 {tool_cfg.name}: 已注入认证头 {target_header}")
     
     # 执行 HTTP 请求
-    logger.info(f"HTTP tool {tool_cfg.name}: {method} {url}")
+    logger.info(f"HTTP 工具 {tool_cfg.name}: 发送 {method} 请求 {url}")
     
     async with httpx.AsyncClient(timeout=config.HTTP_TOOL_TIMEOUT) as client:
         if method == "GET":
@@ -67,9 +67,9 @@ async def execute_http_tool(
     
     try:
         result = resp.json()
-        logger.info(f"HTTP tool {tool_cfg.name}: success")
+        logger.info(f"HTTP 工具 {tool_cfg.name}: 调用成功")
         return result
     except Exception as e:
-        logger.warning(f"HTTP tool {tool_cfg.name}: response is not JSON, returning text")
+        logger.warning(f"HTTP 工具 {tool_cfg.name}: 响应不是 JSON，改为返回文本")
         return {"text": resp.text}
 
