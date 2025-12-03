@@ -17,22 +17,18 @@ class BaseNativeTool(ABC):
     @abstractmethod
     def run(self, args: BaseModel, context: Dict[str, Any]) -> Any:
         """执行工具
-        
-        Args:
-            args: 工具参数，符合 args_schema 定义
-            context: 执行上下文（可包含 trace_id、user_id 等）
-            
-        Returns:
-            工具执行结果
+
+        :param args: 工具参数，符合 args_schema 定义
+        :param context: 执行上下文（可包含 trace_id、user_id 等）
+        :return:
         """
         ...
 
     @classmethod
     def json_schema(cls) -> Dict[str, Any]:
         """获取参数的 JSON Schema
-        
-        Returns:
-            参数的 JSON Schema 定义
+
+        :return:
         """
         return cls.args_schema.model_json_schema()
 

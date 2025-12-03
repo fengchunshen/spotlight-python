@@ -18,14 +18,12 @@ def build_tools_from_runtime(
     tool_event_hooks: Optional[ToolEventHooks] = None,
 ) -> Dict[str, Callable]:
     """根据 runtime_config.tools 构建运行时工具集合
-    
-    Args:
-        tool_cfgs: 工具配置列表
-        vault: 密钥保险库
-        trace_id: 链路追踪 ID
-        
-    Returns:
-        工具名 -> 可调用对象的字典
+
+    :param tool_cfgs: 工具配置列表
+    :param vault: 密钥保险库
+    :param trace_id: 链路追踪 ID
+    :param tool_event_hooks: 工具事件 Hook 字典
+    :return:
     """
     logger = get_logger(trace_id)
     tools: Dict[str, Callable] = {}

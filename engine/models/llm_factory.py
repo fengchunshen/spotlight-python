@@ -8,12 +8,9 @@ from engine.schemas.payload import ModelConfig
 
 def build_llm(model_cfg: ModelConfig) -> ChatOpenAI:
     """根据模型配置构建 LLM 客户端
-    
-    Args:
-        model_cfg: 模型配置对象
-        
-    Returns:
-        ChatOpenAI 实例，配置了流式输出
+
+    :param model_cfg: 模型配置对象
+    :return:
     """
     return ChatOpenAI(
         model=model_cfg.model_name,

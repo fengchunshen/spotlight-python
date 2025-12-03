@@ -16,18 +16,13 @@ async def execute_http_tool(
     trace_id: str = ""
 ) -> Any:
     """执行 HTTP 工具调用
-    
-    Args:
-        tool_cfg: 工具配置
-        args: 工具参数
-        vault: 密钥保险库
-        trace_id: 链路追踪 ID
-        
-    Returns:
-        HTTP 响应的 JSON 数据
-        
-    Raises:
-        httpx.HTTPError: HTTP 请求失败
+
+    :param tool_cfg: 工具配置
+    :param args: 工具参数
+    :param vault: 密钥保险库
+    :param trace_id: 链路追踪 ID
+    :return:
+    :raises httpx.HTTPError: HTTP 请求失败
     """
     logger = get_logger(trace_id)
     exec_cfg = tool_cfg.execution_config

@@ -267,12 +267,9 @@ async def health():
 @app.post("/v1/run_workflow")
 async def run_workflow(payload: Payload):
     """执行工作流 - 唯一业务接口
-    
-    Args:
-        payload: 执行载荷，符合《通用执行载荷协议标准》
-        
-    Returns:
-        SSE 事件流
+
+    :param payload: 执行载荷，符合《通用执行载荷协议标准》
+    :return:
     """
     
     async def event_stream() -> AsyncGenerator[str, None]:

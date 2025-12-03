@@ -23,15 +23,10 @@ WORKFLOWS: Dict[str, WorkflowBuilder] = {
 
 def get_workflow_builder(workflow_id: str) -> WorkflowBuilder:
     """根据 workflow_id 获取工作流构建函数
-    
-    Args:
-        workflow_id: 工作流 ID
-        
-    Returns:
-        工作流构建函数
-        
-    Raises:
-        ValueError: 未知的 workflow_id
+
+    :param workflow_id: 工作流 ID
+    :return:
+    :raises ValueError: 未知的 workflow_id
     """
     if workflow_id not in WORKFLOWS:
         raise ValueError(f"Unknown workflow_id: {workflow_id}")
@@ -40,9 +35,8 @@ def get_workflow_builder(workflow_id: str) -> WorkflowBuilder:
 
 def list_workflows() -> List[str]:
     """列出所有已注册的工作流 ID
-    
-    Returns:
-        工作流 ID 列表
+
+    :return:
     """
     return list(WORKFLOWS.keys())
 
