@@ -36,7 +36,7 @@ class ToolConfig(BaseModel):
 
 class ModelConfig(BaseModel):
     """模型配置"""
-    provider: str
+    provider: Optional[str] = None  # 厂商标识，Python 端不使用，仅用于协议兼容
     model_name: str
     base_url: str
     api_key: str

@@ -2,6 +2,14 @@
 
 单一业务接口: POST /v1/run_workflow
 """
+import sys
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径，支持直接运行此文件
+_project_root = Path(__file__).parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator
@@ -13,6 +21,8 @@ from engine.tools.loader import build_tools_from_runtime
 from engine.workflows.registry import get_workflow_builder, list_workflows
 from engine.sse.emitter import (
     format_tool_thinking,
+    format_tool_start,
+    format_tool_result,
     format_message_chunk,
     format_done,
     format_error,
@@ -100,28 +110,151 @@ async def run_workflow(payload: Payload):
                 "messages": [m.model_dump() for m in payload.input.messages],
             }
             
-            # 7. 执行工作流
-            logger.info("Executing workflow")
+            # 7. 执行工作流（流式）
+            logger.info("Executing workflow (streaming)")
             yield format_tool_thinking("正在执行工作流...", trace_id)
             
-            final_state = graph.invoke(init_state)
+            # 初始化 token usage 统计
+            usage_data = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
+            finish_reason = "stop"
+            accumulated_content = ""
+            stream_error = None
             
-            # 8. 提取结果
-            messages = final_state.get("messages", [])
-            if messages:
-                last_message = messages[-1]
-                answer = last_message.get("content", "")
-                
-                # 输出消息片段（后续可拆分为流式）
-                logger.info(f"Workflow completed, response length: {len(answer)}")
-                yield format_message_chunk(answer, trace_id)
+            # 使用 astream_events 实现流式执行
+            try:
+                async for event in graph.astream_events(init_state, version="v2"):
+                    event_name = event.get("event", "")
+                    event_data = event.get("data", {})
+                    
+                    try:
+                        # 处理 LLM 流式输出事件
+                        if event_name in ("on_chat_model_stream", "on_chat_model_chunk"):
+                            # 提取 token 内容
+                            chunk = event_data.get("chunk")
+                            content = ""
+                            
+                            if chunk is not None:
+                                # 处理不同类型的 chunk 对象
+                                if hasattr(chunk, "content"):
+                                    # LangChain AIMessageChunk 对象
+                                    content = chunk.content
+                                elif hasattr(chunk, "text"):
+                                    # 某些情况下可能是 text 属性
+                                    content = chunk.text
+                                elif isinstance(chunk, dict):
+                                    # 字典格式
+                                    content = chunk.get("content", chunk.get("text", ""))
+                                elif isinstance(chunk, str):
+                                    # 直接是字符串
+                                    content = chunk
+                                else:
+                                    # 尝试转换为字符串
+                                    content = str(chunk) if chunk else ""
+                                
+                                if content:
+                                    accumulated_content += content
+                                    # 实时输出 message_chunk 事件
+                                    yield format_message_chunk(content, trace_id)
+                        
+                        # 处理 LLM 完成事件，提取 usage_metadata
+                        elif event_name == "on_chat_model_end":
+                            output = event_data.get("output")
+                            if output:
+                                usage_metadata = None
+                                
+                                # 方法1: 从 response_metadata 中提取
+                                if hasattr(output, "response_metadata"):
+                                    rm = output.response_metadata
+                                    if isinstance(rm, dict):
+                                        usage_metadata = rm.get("usage_metadata")
+                                    elif hasattr(rm, "get"):
+                                        usage_metadata = rm.get("usage_metadata")
+                                
+                                # 方法2: 如果 output 是字典，直接获取
+                                if not usage_metadata and isinstance(output, dict):
+                                    rm = output.get("response_metadata", {})
+                                    if isinstance(rm, dict):
+                                        usage_metadata = rm.get("usage_metadata")
+                                
+                                # 提取 usage 数据
+                                if usage_metadata:
+                                    if isinstance(usage_metadata, dict):
+                                        usage_data["prompt_tokens"] = usage_metadata.get("prompt_tokens", 0)
+                                        usage_data["completion_tokens"] = usage_metadata.get("completion_tokens", 0)
+                                        usage_data["total_tokens"] = usage_metadata.get("total_tokens", 0)
+                                    elif hasattr(usage_metadata, "prompt_tokens"):
+                                        # 如果是对象，尝试获取属性
+                                        usage_data["prompt_tokens"] = getattr(usage_metadata, "prompt_tokens", 0)
+                                        usage_data["completion_tokens"] = getattr(usage_metadata, "completion_tokens", 0)
+                                        usage_data["total_tokens"] = getattr(usage_metadata, "total_tokens", 0)
+                                
+                                # 如果仍然没有获取到，尝试从 output 的其他位置获取
+                                if usage_data["total_tokens"] == 0:
+                                    # 某些 LLM 可能将 usage 信息放在不同位置
+                                    if hasattr(output, "usage"):
+                                        usage_obj = output.usage
+                                        if isinstance(usage_obj, dict):
+                                            usage_data["prompt_tokens"] = usage_obj.get("prompt_tokens", 0)
+                                            usage_data["completion_tokens"] = usage_obj.get("completion_tokens", 0)
+                                            usage_data["total_tokens"] = usage_obj.get("total_tokens", 0)
+                        
+                        # 处理工具调用开始事件
+                        elif event_name == "on_tool_start":
+                            tool_name = event_data.get("name", "unknown")
+                            input_data = event_data.get("input", {})
+                            yield format_tool_start(tool_name, input_data, trace_id)
+                        
+                        # 处理工具调用结束事件
+                        elif event_name == "on_tool_end":
+                            tool_name = event_data.get("name", "unknown")
+                            output = event_data.get("output")
+                            yield format_tool_result(tool_name, output, trace_id)
+                        
+                        # 处理工作流完成事件
+                        elif event_name == "on_chain_end":
+                            # 检查是否有 finish_reason 信息
+                            output = event_data.get("output", {})
+                            if isinstance(output, dict):
+                                # 尝试从输出中提取 finish_reason
+                                if "finish_reason" in output:
+                                    finish_reason = output["finish_reason"]
+                            elif hasattr(output, "finish_reason"):
+                                finish_reason = output.finish_reason
+                    
+                    except Exception as e:
+                        # 记录事件处理错误，但不中断整个流
+                        logger.warning(f"Error processing event {event_name}: {str(e)}")
+                        # 记录错误但不抛出，继续处理后续事件
+                        stream_error = e
+                        continue
+            
+            except Exception as stream_exception:
+                # 流式执行过程中的严重错误
+                logger.error(f"Stream execution error: {str(stream_exception)}")
+                logger.error(traceback.format_exc())
+                stream_error = stream_exception
+                # 如果已经有部分内容输出，先输出已累积的内容
+                if accumulated_content:
+                    yield format_message_chunk(accumulated_content, trace_id)
+            
+            # 8. 输出完成事件（即使有错误也要输出，确保前端能收到完成信号）
+            if stream_error:
+                # 如果有流式错误，记录但继续完成流程
+                logger.warning(f"Workflow completed with errors, total_tokens: {usage_data['total_tokens']}")
             else:
-                logger.warning("No messages in final state")
-                yield format_message_chunk("", trace_id)
+                logger.info(f"Workflow completed, total_tokens: {usage_data['total_tokens']}")
             
-            # 9. 输出完成事件
-            # TODO: 从 LLM 响应中提取实际的 token usage
-            yield format_done(usage=0, finish_reason="stop", trace_id=trace_id)
+            # 如果无法提取 usage，使用默认值（已在初始化时设置）
+            # 确保 usage_data 始终有效
+            if usage_data["total_tokens"] == 0 and accumulated_content:
+                # 如果无法获取准确的 token 数，但确实有输出，记录警告
+                logger.warning("Unable to extract token usage from LLM response, using default values")
+            
+            yield format_done(usage=usage_data, finish_reason=finish_reason, trace_id=trace_id)
             logger.info("Workflow execution completed successfully")
             
         except Exception as e:

@@ -102,17 +102,26 @@ def format_message_chunk(content: str, trace_id: str) -> str:
     return format_sse("message_chunk", {"content": content, "trace_id": trace_id})
 
 
-def format_done(usage: int, finish_reason: str, trace_id: str) -> str:
+def format_done(usage: Dict[str, int], finish_reason: str, trace_id: str) -> str:
     """格式化完成事件
     
     Args:
-        usage: token 使用量
+        usage: token 使用量字典，格式为 {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+              也支持向后兼容：如果传入 int，会自动转换为字典格式（total_tokens）
         finish_reason: 结束原因（如 stop, length, tool_calls）
         trace_id: 链路追踪 ID
         
     Returns:
         SSE 事件字符串
     """
+    # 向后兼容：如果传入 int，转换为字典格式
+    if isinstance(usage, int):
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": usage
+        }
+    
     return format_sse("done", {
         "usage": usage,
         "finish_reason": finish_reason,
