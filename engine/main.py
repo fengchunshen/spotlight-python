@@ -3,6 +3,7 @@
 单一业务接口: POST /v1/run_workflow
 """
 import sys
+import asyncio
 from pathlib import Path
 
 # 添加项目根目录到 Python 路径，支持直接运行此文件
@@ -17,7 +18,7 @@ import traceback
 
 from engine.schemas.payload import Payload, Message
 from engine.models.llm_factory import build_llm
-from engine.tools.loader import build_tools_from_runtime
+from engine.tools.loader import build_tools_from_runtime, ToolEventHooks
 from engine.workflows.registry import get_workflow_builder, list_workflows
 from engine.sse.emitter import (
     format_tool_thinking,
@@ -38,47 +39,6 @@ app = FastAPI(
 )
 
 
-IDENTITY_RESPONSE = (
-    "您好，我是依托 GPT-5.1 模型的智能助手，在 Cursor IDE 中为您提供代码编写和问题解答服务，"
-    "你可以直接告诉我你的需求。"
-)
-
-IDENTITY_KEYWORDS = (
-    "你是谁",
-    "你是?",
-    "你是？",
-    "你是什么模型",
-    "你是什么",
-    "who are you",
-    "what model",
-    "what are you",
-    "which model",
-    "identify yourself",
-)
-
-
-def is_identity_query(messages: List[Message]) -> bool:
-    """
-    判断用户是否在询问助手身份
-
-    :param messages: 输入消息列表
-    :return:
-    """
-    if not messages:
-        return False
-
-    for msg in reversed(messages):
-        if msg.role != "user":
-            continue
-        content = str(msg.content).strip().lower()
-        if not content:
-            return False
-        for keyword in IDENTITY_KEYWORDS:
-            if keyword.lower() in content:
-                return True
-        break
-
-    return False
 
 
 def safe_int(value: Any) -> int:
@@ -247,6 +207,47 @@ def extract_usage_from_output(output: Any) -> Optional[Dict[str, int]]:
     return normalize_usage_payload(output)
 
 
+IDENTITY_KEYWORDS: List[str] = [
+    "你是谁",
+    "是谁开发",
+    "介绍一下你",
+    "身份",
+    "who are you",
+    "what are you",
+    "your identity",
+]
+
+
+IDENTITY_RESPONSE = (
+    "我是 SpotLight Python 执行平面的智能代理，负责调度工作流与工具以完成你的任务。"
+)
+
+
+def is_identity_query(messages: List[Message]) -> bool:
+    """
+    判断用户是否在询问身份
+
+    :param messages: 会话消息列表
+    :return:
+    """
+    if not messages:
+        return False
+
+    latest_user = next((msg for msg in reversed(messages) if msg.role == "user"), None)
+    if latest_user is None:
+        return False
+
+    if not isinstance(latest_user.content, str):
+        return False
+
+    content = latest_user.content.strip().lower()
+    for keyword in IDENTITY_KEYWORDS:
+        if keyword in content:
+            return True
+
+    return False
+
+
 @app.get("/")
 async def root():
     """根路径 - 返回服务信息"""
@@ -278,64 +279,30 @@ async def run_workflow(payload: Payload):
         """SSE 事件流生成器"""
         trace_id = payload.task_meta.trace_id
         logger = get_logger(trace_id)
-        
-        try:
-            # 1. 验证 workflow_id
-            workflow_id = payload.task_meta.workflow_id
-            logger.info(f"开始执行工作流: {workflow_id}")
-            
-            # 发送初始思考事件
-            yield format_tool_thinking("正在初始化工作流...", trace_id)
-            
-            # 身份问答拦截
-            if is_identity_query(payload.input.messages):
-                logger.info("检测到身份查询，返回预置回复")
-                yield format_message_chunk(IDENTITY_RESPONSE, trace_id)
-                yield format_done(
-                    usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                    finish_reason="identity_guard",
-                    trace_id=trace_id
-                )
-                return
 
-            # 2. 构建 LLM
-            model_cfg = payload.runtime_config.model
-            logger.info("正在构建 LLM 客户端")
-            yield format_tool_thinking("正在连接模型服务...", trace_id)
-            llm = build_llm(model_cfg)
-            
-            # 3. 构建工具集
-            logger.info(f"正在加载 {len(payload.runtime_config.tools)} 个工具")
-            yield format_tool_thinking("正在加载工具...", trace_id)
-            tools = build_tools_from_runtime(
-                payload.runtime_config.tools,
-                payload.runtime_config.vault,
-                trace_id
-            )
-            
-            # 4. 获取工作流构建器
-            try:
-                builder = get_workflow_builder(workflow_id)
-            except ValueError as e:
-                logger.error(f"非法的 workflow_id: {workflow_id}")
-                yield format_error(400, str(e), trace_id)
-                return
-            
-            # 5. 构建工作流图
-            logger.info("正在构建工作流图")
-            yield format_tool_thinking("正在构建工作流...", trace_id)
-            graph = builder(llm=llm)
-            
-            # 6. 准备初始状态
-            init_state = {
-                "messages": [m.model_dump() for m in payload.input.messages],
-            }
-            
-            # 7. 执行工作流（流式）
-            logger.info("以流式模式执行工作流")
-            yield format_tool_thinking("正在执行工作流...", trace_id)
-            
-            # 初始化 token usage 统计
+        sse_queue: asyncio.Queue[Any] = asyncio.Queue()
+        stream_complete_marker = object()
+
+        async def emit(event: str) -> None:
+            await sse_queue.put(event)
+
+        async def emit_tool_start(tool_name: str, args: Dict[str, Any]) -> None:
+            await emit(format_tool_start(tool_name, args, trace_id))
+
+        async def emit_tool_result(tool_name: str, result: Any) -> None:
+            await emit(format_tool_result(tool_name, result, trace_id))
+
+        async def emit_tool_error(tool_name: str, exc: Exception) -> None:
+            await emit(format_tool_result(tool_name, {"error": str(exc)}, trace_id))
+
+        tool_event_hooks: ToolEventHooks = {
+            "on_start": emit_tool_start,
+            "on_result": emit_tool_result,
+            "on_error": emit_tool_error,
+        }
+        tool_events_via_hooks = True
+
+        async def run_flow() -> None:
             usage_data = {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -343,121 +310,155 @@ async def run_workflow(payload: Payload):
             }
             finish_reason = "stop"
             accumulated_content = ""
-            stream_error = None
-            
-            # 使用 astream_events 实现流式执行
+            stream_error: Optional[Exception] = None
+
             try:
-                async for event in graph.astream_events(init_state, version="v2"):
-                    event_name = event.get("event", "")
-                    event_data = event.get("data", {})
-                    
-                    try:
-                        # 处理 LLM 流式输出事件
-                        if event_name in ("on_chat_model_stream", "on_chat_model_chunk"):
-                            # 提取 token 内容
-                            chunk = event_data.get("chunk")
-                            content = ""
-                            
-                            if chunk is not None:
-                                usage_from_chunk = extract_usage_from_chunk(chunk, event_data)
-                                if usage_from_chunk:
-                                    usage_data.update(usage_from_chunk)
-                                # 处理不同类型的 chunk 对象
-                                if hasattr(chunk, "content"):
-                                    # LangChain AIMessageChunk 对象
-                                    content = chunk.content
-                                elif hasattr(chunk, "text"):
-                                    # 某些情况下可能是 text 属性
-                                    content = chunk.text
-                                elif isinstance(chunk, dict):
-                                    # 字典格式
-                                    content = chunk.get("content", chunk.get("text", ""))
-                                elif isinstance(chunk, str):
-                                    # 直接是字符串
-                                    content = chunk
-                                else:
-                                    # 尝试转换为字符串
-                                    content = str(chunk) if chunk else ""
-                                
-                                if content:
-                                    accumulated_content += content
-                                    # 实时输出 message_chunk 事件
-                                    yield format_message_chunk(content, trace_id)
-                                
-                        
-                        # 处理 LLM 完成事件，提取 usage_metadata
-                        elif event_name == "on_chat_model_end":
-                            output = event_data.get("output")
-                            usage_from_output = extract_usage_from_output(output)
-                            if usage_from_output:
-                                usage_data.update(usage_from_output)
-                        
-                        # 处理工具调用开始事件
-                        elif event_name == "on_tool_start":
-                            tool_name = event_data.get("name", "unknown")
-                            input_data = event_data.get("input", {})
-                            yield format_tool_start(tool_name, input_data, trace_id)
-                        
-                        # 处理工具调用结束事件
-                        elif event_name == "on_tool_end":
-                            tool_name = event_data.get("name", "unknown")
-                            output = event_data.get("output")
-                            yield format_tool_result(tool_name, output, trace_id)
-                        
-                        # 处理工作流完成事件
-                        elif event_name == "on_chain_end":
-                            # 检查是否有 finish_reason 信息
-                            output = event_data.get("output", {})
-                            if isinstance(output, dict):
-                                # 尝试从输出中提取 finish_reason
-                                if "finish_reason" in output:
+                workflow_id = payload.task_meta.workflow_id
+                logger.info(f"开始执行工作流: {workflow_id}")
+                await emit(format_tool_thinking("正在初始化工作流...", trace_id))
+
+                if is_identity_query(payload.input.messages):
+                    logger.info("检测到身份查询，返回预置回复")
+                    await emit(format_message_chunk(IDENTITY_RESPONSE, trace_id))
+                    await emit(format_done(
+                        usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                        finish_reason="identity_guard",
+                        trace_id=trace_id
+                    ))
+                    return
+
+                model_cfg = payload.runtime_config.model
+                logger.info("正在构建 LLM 客户端")
+                await emit(format_tool_thinking("正在连接模型服务...", trace_id))
+                llm = build_llm(model_cfg)
+
+                logger.info(f"正在加载 {len(payload.runtime_config.tools)} 个工具")
+                await emit(format_tool_thinking("正在加载工具...", trace_id))
+                tools = build_tools_from_runtime(
+                    payload.runtime_config.tools,
+                    payload.runtime_config.vault,
+                    trace_id,
+                    tool_event_hooks=tool_event_hooks
+                )
+
+                try:
+                    builder = get_workflow_builder(workflow_id)
+                except ValueError as e:
+                    logger.error(f"非法的 workflow_id: {workflow_id}")
+                    await emit(format_error(400, str(e), trace_id))
+                    return
+
+                logger.info("正在构建工作流图")
+                await emit(format_tool_thinking("正在构建工作流...", trace_id))
+                graph = builder(
+                    llm=llm,
+                    tools=tools,
+                    tool_configs=payload.runtime_config.tools
+                )
+
+                init_state = {
+                    "messages": [m.model_dump() for m in payload.input.messages],
+                }
+
+                logger.info("以流式模式执行工作流")
+                await emit(format_tool_thinking("正在执行工作流...", trace_id))
+
+                try:
+                    async for event in graph.astream_events(init_state, version="v2"):
+                        event_name = event.get("event", "")
+                        event_data = event.get("data", {})
+
+                        try:
+                            if event_name in ("on_chat_model_stream", "on_chat_model_chunk"):
+                                chunk = event_data.get("chunk")
+                                content = ""
+
+                                if chunk is not None:
+                                    usage_from_chunk = extract_usage_from_chunk(chunk, event_data)
+                                    if usage_from_chunk:
+                                        usage_data.update(usage_from_chunk)
+
+                                    if hasattr(chunk, "content"):
+                                        content = chunk.content
+                                    elif hasattr(chunk, "text"):
+                                        content = chunk.text
+                                    elif isinstance(chunk, dict):
+                                        content = chunk.get("content", chunk.get("text", ""))
+                                    elif isinstance(chunk, str):
+                                        content = chunk
+                                    else:
+                                        content = str(chunk) if chunk else ""
+
+                                    if content:
+                                        accumulated_content += content
+                                        await emit(format_message_chunk(content, trace_id))
+
+                            elif event_name == "on_chat_model_end":
+                                output = event_data.get("output")
+                                usage_from_output = extract_usage_from_output(output)
+                                if usage_from_output:
+                                    usage_data.update(usage_from_output)
+
+                            elif event_name == "on_tool_start" and not tool_events_via_hooks:
+                                tool_name = event_data.get("name", "unknown")
+                                input_data = event_data.get("input", {})
+                                await emit(format_tool_start(tool_name, input_data, trace_id))
+
+                            elif event_name == "on_tool_end" and not tool_events_via_hooks:
+                                tool_name = event_data.get("name", "unknown")
+                                output = event_data.get("output")
+                                await emit(format_tool_result(tool_name, output, trace_id))
+
+                            elif event_name == "on_chain_end":
+                                output = event_data.get("output", {})
+                                if isinstance(output, dict) and "finish_reason" in output:
                                     finish_reason = output["finish_reason"]
-                            elif hasattr(output, "finish_reason"):
-                                finish_reason = output.finish_reason
-                    
-                    except Exception as e:
-                        # 记录事件处理错误，但不中断整个流
-                        logger.warning(f"处理事件 {event_name} 时出错: {str(e)}")
-                        # 记录错误但不抛出，继续处理后续事件
-                        stream_error = e
-                        continue
-            
-            except Exception as stream_exception:
-                # 流式执行过程中的严重错误
-                logger.error(f"流式执行出现异常: {str(stream_exception)}")
+                                elif hasattr(output, "finish_reason"):
+                                    finish_reason = output.finish_reason
+
+                        except Exception as event_error:
+                            logger.warning(f"处理事件 {event_name} 时出错: {str(event_error)}")
+                            stream_error = event_error
+                            continue
+
+                except Exception as stream_exception:
+                    logger.error(f"流式执行出现异常: {str(stream_exception)}")
+                    logger.error(traceback.format_exc())
+                    stream_error = stream_exception
+                    if accumulated_content:
+                        await emit(format_message_chunk(accumulated_content, trace_id))
+
+                if stream_error:
+                    logger.warning(f"工作流执行结束但存在错误，总 tokens: {usage_data['total_tokens']}")
+                else:
+                    logger.info(f"工作流执行完成，总 tokens: {usage_data['total_tokens']}")
+
+                if usage_data["total_tokens"] == 0 and accumulated_content:
+                    logger.warning("无法从模型响应中提取 token 用量，使用默认值")
+
+                await emit(format_done(usage=usage_data, finish_reason=finish_reason, trace_id=trace_id))
+                logger.info("工作流执行成功结束")
+
+            except Exception as exc:
+                logger.error(f"工作流执行失败: {str(exc)}")
                 logger.error(traceback.format_exc())
-                stream_error = stream_exception
-                # 如果已经有部分内容输出，先输出已累积的内容
-                if accumulated_content:
-                    yield format_message_chunk(accumulated_content, trace_id)
-            
-            # 8. 输出完成事件（即使有错误也要输出，确保前端能收到完成信号）
-            if stream_error:
-                # 如果有流式错误，记录但继续完成流程
-                logger.warning(f"工作流执行结束但存在错误，总 tokens: {usage_data['total_tokens']}")
-            else:
-                logger.info(f"工作流执行完成，总 tokens: {usage_data['total_tokens']}")
-            
-            # 如果无法提取 usage，使用默认值（已在初始化时设置）
-            # 确保 usage_data 始终有效
-            if usage_data["total_tokens"] == 0 and accumulated_content:
-                # 如果无法获取准确的 token 数，但确实有输出，记录警告
-                logger.warning("无法从模型响应中提取 token 用量，使用默认值")
-            
-            yield format_done(usage=usage_data, finish_reason=finish_reason, trace_id=trace_id)
-            logger.info("工作流执行成功结束")
-            
-        except Exception as e:
-            # 捕获所有异常并转换为 SSE error 事件
-            logger.error(f"工作流执行失败: {str(e)}")
-            logger.error(traceback.format_exc())
-            
-            # 返回安全的错误消息（不泄露内部实现细节）
-            error_msg = "工作流执行失败"
-            if isinstance(e, (ValueError, TypeError)):
-                error_msg = str(e)
-            
-            yield format_error(code=500, msg=error_msg, trace_id=trace_id)
+                error_msg = "工作流执行失败"
+                if isinstance(exc, (ValueError, TypeError)):
+                    error_msg = str(exc)
+                await emit(format_error(code=500, msg=error_msg, trace_id=trace_id))
+
+            finally:
+                await sse_queue.put(stream_complete_marker)
+
+        workflow_task = asyncio.create_task(run_flow())
+
+        while True:
+            event_item = await sse_queue.get()
+            if event_item is stream_complete_marker:
+                break
+            yield event_item
+
+        await workflow_task
     
     return StreamingResponse(
         event_stream(),

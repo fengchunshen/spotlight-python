@@ -1,12 +1,13 @@
 """基础对话型 LangGraph 工作流
 
-实现基于 LLM 的对话能力，默认不引入工具节点
-为后续扩展 function calling 和工具执行预留挂载点
+实现基于 LLM 的对话能力，并支持 LangChain function calling 工具执行
 """
-from typing import Any, Dict, List, TypedDict
+import json
+from typing import Any, Awaitable, Callable, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
+from engine.schemas.payload import ToolConfig
 
 
 class AgentState(TypedDict):
@@ -14,48 +15,277 @@ class AgentState(TypedDict):
     messages: List[Dict[str, Any]]
 
 
-def build_agent_chat_graph(llm: BaseChatModel):
-    """构建对话 Agent 工作流图
-    
-    Args:
-        llm: LLM 客户端
-        
-    Returns:
-        编译后的 LangGraph 工作流
+def build_agent_chat_graph(
+    llm: BaseChatModel,
+    tools: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]],
+    tool_configs: List[ToolConfig],
+) -> Any:
+    """构建支持工具调用的对话工作流
+
+    :param llm: LLM 客户端
+    :param tools: 已加载工具映射
+    :param tool_configs: 工具配置列表
+    :return: 编译后的 LangGraph 工作流
     """
     graph = StateGraph(AgentState)
+    llm_with_tools = _bind_llm_tools(llm, tool_configs)
 
-    def llm_node(state: AgentState) -> AgentState:
-        """LLM 节点 - 处理对话"""
-        # 转换消息格式
-        lc_messages = []
-        for msg in state["messages"]:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "system":
-                lc_messages.append(SystemMessage(content=content))
-            elif role == "user":
-                lc_messages.append(HumanMessage(content=content))
-            elif role == "assistant":
-                lc_messages.append(AIMessage(content=content))
-            # tool 消息暂时忽略
-        
-        # 调用 LLM
-        resp = llm.invoke(lc_messages)
-        
-        # 添加 assistant 回复到消息列表
-        state["messages"].append({
-            "role": "assistant",
-            "content": resp.content
-        })
-        
-        return state
+    async def llm_node(state: AgentState) -> AgentState:
+        """LLM 节点 - 处理对话与工具调用"""
+        loop_guard = 0
+        while loop_guard < 5:
+            lc_messages = _convert_messages(state["messages"])
+            response = await llm_with_tools.ainvoke(lc_messages)
+            assistant_message = _serialize_assistant_message(response)
+            state["messages"].append(assistant_message)
 
-    # 构建图结构
+            tool_calls = _extract_tool_calls(response)
+            if not tool_calls:
+                return state
+
+            tool_messages = await _execute_tool_calls(tool_calls, tools)
+            state["messages"].extend(tool_messages)
+            loop_guard += 1
+
+        raise RuntimeError("Tool calling exceeded maximum iterations")
+
     graph.add_node("llm", llm_node)
     graph.set_entry_point("llm")
     graph.add_edge("llm", END)
 
     return graph.compile()
+
+
+def _bind_llm_tools(
+    llm: BaseChatModel,
+    tool_configs: List[ToolConfig],
+) -> BaseChatModel:
+    """绑定工具定义，如果没有工具则返回原始 LLM
+
+    :param llm: 原始 LLM 实例
+    :param tool_configs: 工具配置列表
+    :return: 绑定后的 LLM
+    """
+    if not tool_configs:
+        return llm
+
+    tool_definitions = []
+    for cfg in tool_configs:
+        schema = cfg.parameter_schema or {"type": "object", "properties": {}, "required": []}
+        tool_definitions.append({
+            "type": "function",
+            "function": {
+                "name": cfg.name,
+                "description": cfg.description or "",
+                "parameters": schema,
+            },
+        })
+
+    return llm.bind_tools(tool_definitions)
+
+
+def _convert_messages(messages: List[Dict[str, Any]]) -> List[Any]:
+    """将内部消息结构转换为 LangChain 消息
+
+    :param messages: 当前状态消息列表
+    :return: LangChain 消息对象列表
+    """
+    lc_messages: List[Any] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+
+        if role == "system":
+            lc_messages.append(SystemMessage(content=content))
+        elif role == "user":
+            lc_messages.append(HumanMessage(content=content))
+        elif role == "assistant":
+            additional_kwargs = {}
+            if "tool_calls" in msg:
+                additional_kwargs["tool_calls"] = msg["tool_calls"]
+            lc_messages.append(AIMessage(content=content, additional_kwargs=additional_kwargs))
+        elif role == "tool":
+            lc_messages.append(
+                ToolMessage(
+                    content=_stringify_tool_content(content),
+                    tool_call_id=msg.get("tool_call_id", ""),
+                )
+            )
+
+    return lc_messages
+
+
+def _serialize_assistant_message(response: AIMessage) -> Dict[str, Any]:
+    """把 LLM 响应转换为内部消息结构
+
+    :param response: LLM 输出
+    :return: 内部消息结构
+    """
+    serialized: Dict[str, Any] = {
+        "role": "assistant",
+        "content": response.content or "",
+    }
+
+    tool_calls = _extract_tool_calls(response)
+    if tool_calls:
+        serialized["tool_calls"] = tool_calls
+
+    return serialized
+
+
+def _extract_tool_calls(response: AIMessage) -> List[Dict[str, Any]]:
+    """抽取 LLM 返回的工具调用定义
+
+    :param response: LLM 输出
+    :return: 工具调用列表
+    """
+    normalized_calls: List[Dict[str, Any]] = []
+    raw_calls: List[Any] = []
+
+    if getattr(response, "tool_calls", None):
+        raw_calls.extend(response.tool_calls)
+
+    additional = response.additional_kwargs.get("tool_calls")
+    if isinstance(additional, list):
+        raw_calls.extend(additional)
+
+    for call in raw_calls:
+        normalized = _normalize_tool_call(call)
+        if normalized:
+            normalized_calls.append(normalized)
+
+    return normalized_calls
+
+
+def _normalize_tool_call(call: Any) -> Dict[str, Any]:
+    """
+    规范化工具调用结构
+
+    :param call: LLM 返回的工具调用定义
+    :return:
+    """
+    call_dict: Dict[str, Any]
+    if isinstance(call, dict):
+        call_dict = call
+    elif hasattr(call, "model_dump"):
+        call_dict = call.model_dump()
+    elif hasattr(call, "dict"):
+        call_dict = call.dict()
+    else:
+        return {}
+
+    if "function" in call_dict:
+        function_meta = call_dict.get("function") or {}
+        return {
+            "id": call_dict.get("id", ""),
+            "type": call_dict.get("type", "function"),
+            "function": {
+                "name": function_meta.get("name", ""),
+                "arguments": _stringify_arguments(function_meta.get("arguments")),
+            },
+        }
+
+    arguments = call_dict.get("arguments")
+    if arguments is None:
+        arguments = call_dict.get("args")
+
+    return {
+        "id": call_dict.get("id", ""),
+        "type": call_dict.get("type", "function"),
+        "function": {
+            "name": call_dict.get("name", ""),
+            "arguments": _stringify_arguments(arguments),
+        },
+    }
+
+
+async def _execute_tool_calls(
+    tool_calls: List[Dict[str, Any]],
+    tools: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]],
+) -> List[Dict[str, Any]]:
+    """执行工具调用并生成 tool 消息
+
+    :param tool_calls: LLM 工具调用定义
+    :param tools: 已加载工具映射
+    :return: 工具返回的消息列表
+    """
+    tool_messages: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        function_meta = call.get("function", {}) if isinstance(call, dict) else {}
+        if not isinstance(function_meta, dict):
+            function_meta = {}
+        tool_name = function_meta.get("name")
+        args_raw = function_meta.get("arguments", "{}")
+        call_id = call.get("id", "")
+
+        if not tool_name:
+            raise ValueError("LLM 返回的 tool call 缺少名称")
+        if tool_name not in tools:
+            raise ValueError(f"工具 {tool_name} 未在运行时加载")
+
+        args = _parse_arguments(args_raw)
+        result = await tools[tool_name](args)
+
+        tool_messages.append({
+            "role": "tool",
+            "name": tool_name,
+            "tool_call_id": call_id,
+            "content": result,
+        })
+
+    return tool_messages
+
+
+def _parse_arguments(arguments: Any) -> Dict[str, Any]:
+    """解析工具参数
+
+    :param arguments: JSON 字符串或字典参数
+    :return: 解析后的参数字典
+    """
+    if not arguments:
+        return {}
+
+    if isinstance(arguments, dict):
+        return arguments
+
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            raise ValueError("工具参数必须是 JSON 对象")
+        except json.JSONDecodeError as exc:
+            raise ValueError("工具参数不是合法 JSON") from exc
+
+    raise ValueError("工具参数必须是 JSON 字符串或对象")
+
+
+def _stringify_tool_content(content: Any) -> str:
+    """将工具输出转换为字符串
+
+    :param content: 工具返回内容
+    :return: 字符串形式
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _stringify_arguments(arguments: Any) -> str:
+    """
+    将工具参数转换为 JSON 字符串
+
+    :param arguments: 任意形式的工具参数
+    :return:
+    """
+    if not arguments:
+        return ""
+    if isinstance(arguments, str):
+        return arguments
+    try:
+        return json.dumps(arguments, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(arguments)
 

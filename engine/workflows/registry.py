@@ -1,11 +1,18 @@
 """工作流注册表 - workflow_id -> 构图函数映射"""
-from typing import Callable, Dict, Any, List
+from typing import Any, Awaitable, Callable, Dict, List
 from langchain_core.language_models.chat_models import BaseChatModel
+from engine.schemas.payload import ToolConfig
 from engine.workflows.agent_chat import build_agent_chat_graph
 
 
+ToolRunner = Callable[[Dict[str, Any]], Awaitable[Any]]
+
+
 # 工作流构建函数类型
-WorkflowBuilder = Callable[[BaseChatModel], Any]
+WorkflowBuilder = Callable[
+    [BaseChatModel, Dict[str, ToolRunner], List[ToolConfig]],
+    Any
+]
 
 
 # 工作流注册表
