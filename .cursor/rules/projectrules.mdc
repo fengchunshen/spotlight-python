@@ -12,6 +12,7 @@ models/（LLM 工厂等）
 tools/（原生工具、HTTP 工具及加载器）
 workflows/（LangGraph 工作流与注册表）
 sse/（SSE 事件封装）
+
 FastAPI & LangGraph
 唯一业务入口：用户业务请求统一通过 POST /v1/run_workflow 进入 engine/main.py，新增业务能力一律通过扩展 workflow_id 与工作流实现，而不是新增多个 REST 接口。
 LangGraph 约定：
@@ -20,15 +21,18 @@ LangGraph 约定：
 新建 workflows/<name>.py
 在 WORKFLOWS 中注册对应的 workflow_id -> builder。
 StateGraph 的 state 使用 Pydantic 模型或类型明确的 dict，避免魔法字段。
+优先使用 LangGraph 流式 API（如 astream_events）实现精细化事件输出，将 LangGraph 事件映射为多条 SSE 事件，避免一次性缓冲完整结果。
+
 执行载荷（Payload）与模型 / 工具配置
 单一事实来源：所有和控制平面交互的执行载荷结构，以 schemas/payload.py 中的 Pydantic 模型为唯一权威定义；如需兼容 Java 字段名差异，优先使用 Field(alias="...") 而不是在业务代码中手动适配。
 模型配置：
 统一使用 ModelConfig + build_llm（在 models/llm_factory.py）来构造 LLM 客户端，不在业务代码中硬编码 base_url、api_key 等。
-默认使用 OneAPI(OpenAI 兼容) 协议，streaming=True 以支持后续 SSE 流式输出。
+默认使用 OneAPI(OpenAI 兼容) 协议，streaming=True 以支持 SSE 流式输出。
 工具系统：
 工具元数据从 runtime_config.tools 读取，使用 ToolConfig 模型描述；不要在工作流代码里写死工具的 URL 或鉴权。
 HTTP 工具调用统一走 tools/http_tool.py 的 execute_http_tool，利用 vault 注入密钥；禁止在日志中输出 vault 的值。
-原生工具必须继承 BaseNativeTool，通过 tools/loader.py 的加载机制接入，而不是在工作流里直接创建临时工具函数。
+原生工具必须继承 BaseNativeTool，通过 tools/loader.py 的加载机制接入，而不是在工作流里直接创建临时工具函数。原生工具通过 execution_config["class"] 反射加载 BaseNativeTool 子类。
+
 SSE 协议与流式输出
 统一封装：所有 SSE 输出必须通过 sse/emitter.py 的 format_sse 生成，禁止在 main.py 或其他业务文件中手工拼接 id/event/data 字符串。
 事件类型集合：默认只使用文档中约定的事件类型，除非同步更新协议文档：
@@ -40,19 +44,24 @@ done
 事件载荷约定：
 每条 data 必须是 JSON 对象（或协议明确允许的字符串），其中关键事件应包含 trace_id，以支持全链路追踪。
 done 必须包含 usage 和 finish_reason 字段；error 至少包含 code 与 msg，且 msg 不泄露密钥或内部实现细节。
-流式执行策略：
-后续引入 LangGraph 流式 API（如 astream_events）时，应将 LangGraph 事件精细映射为多条 SSE 事件，而不是一次性把完整结果缓冲后输出。
-禁止为方便实现而把整段回答组装完再以单个 message_chunk 输出，除非明确是在做非流式兼容模式。
+
 日志、安全与观测性
-trace_id 贯穿全链路：从 Payload.task_meta.trace_id 开始，在日志、工具调用、工作流状态中贯穿使用 trace_id，方便排查问题与链路追踪。
-日志红线：
+trace_id 贯穿全链路：从 Payload.task_meta.trace_id 开始，在日志、工具调用、工作流状态中贯穿使用 trace_id，方便排查问题与链路追踪。所有工具调用函数必须接收 trace_id 参数，不允许使用默认空值。trace_id 必须从调用链上游传递，不得在函数内部生成或忽略。
+日志安全：
 禁止在日志中打印完整请求体、用户消息全文或 vault 内容，必要时只打印脱敏摘要或长度信息。
-错误日志可记录异常类型与栈信息，但返回给前端的 error.msg 需做安全过滤。
-异常与熔断：
+记录可能包含敏感信息的日志时，必须使用 logging_utils.sanitize_log_message() 进行脱敏处理，特别是用户消息、请求体、工具参数等。
+错误处理：
+错误日志可记录异常类型与栈信息，但返回给前端的 error.msg 必须经过安全过滤：
+- 仅暴露用户友好的错误描述，不泄露内部实现细节（如文件路径、类名、内部函数名）
+- 不暴露 API Key、Token、密码等敏感信息
+- 对于系统异常，统一返回"工作流执行失败"，详细错误信息仅记录在后端日志
+- 仅对明确的业务异常（如 ValueError、TypeError）可返回具体错误信息
 工作流或工具内部异常应转换为 SSE error 事件，并在后端日志中记录详细原因。
 对于协议级错误（如字段缺失、非法 workflow_id），优先在请求校验阶段失败并返回结构化错误，而不是在流中途崩溃。
+
 Python 编码与依赖管理
 类型与模型优先：新增结构化数据时优先使用 Pydantic 模型；对外暴露的函数和工作流构造函数写清楚类型注解，方便后续重构。
 异步 IO 优先：FastAPI 处理函数、HTTP 工具调用等对外 IO 逻辑采用 async/await + httpx.AsyncClient，避免在事件循环中使用阻塞 IO。
 依赖管理：所有新依赖必须写入 requirements.txt，优先选择轻量、常用的库；避免在当前最小骨架阶段引入重量级框架或消息中间件，除非方案文档已规划。
+
 概括：以上规则用于指导 Cursor 在本仓进行开发与重构时，严格遵守 FastAPI + LangGraph 最小骨架设计、统一 Payload/SSE 协议，以及安全与日志规范。
