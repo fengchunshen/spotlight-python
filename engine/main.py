@@ -5,6 +5,7 @@
 import sys
 import asyncio
 from pathlib import Path
+from contextlib import suppress
 
 # 添加项目根目录到 Python 路径，支持直接运行此文件
 _project_root = Path(__file__).parent.parent
@@ -16,6 +17,7 @@ from fastapi.responses import StreamingResponse
 from typing import AsyncGenerator, Any, Dict, List, Optional, Set
 import traceback
 
+from engine.config import config
 from engine.schemas.payload import Payload, Message
 from engine.models.llm_factory import build_llm
 from engine.tools.loader import build_tools_from_runtime, ToolEventHooks
@@ -279,6 +281,8 @@ async def run_workflow(payload: Payload):
 
         sse_queue: asyncio.Queue[Any] = asyncio.Queue()
         stream_complete_marker = object()
+        keepalive_interval = config.SSE_KEEPALIVE_INTERVAL
+        keepalive_task: Optional[asyncio.Task[Any]] = None
 
         async def emit(event: str) -> None:
             await sse_queue.put(event)
@@ -447,13 +451,29 @@ async def run_workflow(payload: Payload):
             finally:
                 await sse_queue.put(stream_complete_marker)
 
+        async def keepalive_loop() -> None:
+            """定时推送保活事件"""
+            try:
+                while True:
+                    await asyncio.sleep(keepalive_interval)
+                    await emit(format_keepalive())
+            except asyncio.CancelledError:
+                raise
+
         workflow_task = asyncio.create_task(run_flow())
+        if keepalive_interval > 0:
+            keepalive_task = asyncio.create_task(keepalive_loop())
 
         while True:
             event_item = await sse_queue.get()
             if event_item is stream_complete_marker:
                 break
             yield event_item
+
+        if keepalive_task:
+            keepalive_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await keepalive_task
 
         await workflow_task
     
