@@ -42,6 +42,10 @@ class ModelConfig(BaseModel):
     api_key: str
     temperature: float = 0.7
     max_tokens: Optional[int] = None
+    supports_reasoning_events: bool = Field(
+        default=False,
+        description="模型是否输出 reasoning/rethinking 片段"
+    )
 
 
 class RuntimeConfig(BaseModel):

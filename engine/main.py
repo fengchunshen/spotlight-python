@@ -10,12 +10,12 @@ _project_root = Path(__file__).parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Any, Dict, List, Optional, Set
 import traceback
 
-from engine.schemas.payload import Payload
+from engine.schemas.payload import Payload, Message
 from engine.models.llm_factory import build_llm
 from engine.tools.loader import build_tools_from_runtime
 from engine.workflows.registry import get_workflow_builder, list_workflows
@@ -36,6 +36,215 @@ app = FastAPI(
     description="基于 FastAPI + LangGraph 的工作流执行平面服务",
     version="0.1.0"
 )
+
+
+IDENTITY_RESPONSE = (
+    "您好，我是依托 GPT-5.1 模型的智能助手，在 Cursor IDE 中为您提供代码编写和问题解答服务，"
+    "你可以直接告诉我你的需求。"
+)
+
+IDENTITY_KEYWORDS = (
+    "你是谁",
+    "你是?",
+    "你是？",
+    "你是什么模型",
+    "你是什么",
+    "who are you",
+    "what model",
+    "what are you",
+    "which model",
+    "identify yourself",
+)
+
+
+def is_identity_query(messages: List[Message]) -> bool:
+    """
+    判断用户是否在询问助手身份
+
+    :param messages: 输入消息列表
+    :return:
+    """
+    if not messages:
+        return False
+
+    for msg in reversed(messages):
+        if msg.role != "user":
+            continue
+        content = str(msg.content).strip().lower()
+        if not content:
+            return False
+        for keyword in IDENTITY_KEYWORDS:
+            if keyword.lower() in content:
+                return True
+        break
+
+    return False
+
+
+def safe_int(value: Any) -> int:
+    """
+    安全地将值转换为 int
+
+    :param value: 需要转换的值
+    :return:
+    """
+    if value is None:
+        return 0
+
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return 0
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def to_plain_dict(value: Any) -> Optional[Dict[str, Any]]:
+    """
+    尝试将任意对象转换为字典
+
+    :param value: 任意对象
+    :return:
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        return value
+
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except TypeError:
+            return None
+
+    if hasattr(value, "dict"):
+        try:
+            return value.dict()
+        except TypeError:
+            return None
+
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                key: val
+                for key, val in vars(value).items()
+                if not key.startswith("_")
+            }
+        except TypeError:
+            return None
+
+    return None
+
+
+def normalize_usage_payload(payload: Any) -> Optional[Dict[str, int]]:
+    """
+    标准化解析 usage 数据
+
+    :param payload: 可能包含 usage 的对象或字典
+    :return:
+    """
+    if payload is None:
+        return None
+
+    visited: Set[int] = set()
+    stack: List[Any] = [payload]
+    nested_keys = (
+        "usage",
+        "token_usage",
+        "usage_metadata",
+        "llm_output",
+        "response_metadata",
+        "metadata",
+    )
+
+    while stack:
+        current = stack.pop()
+        if current is None:
+            continue
+
+        identity = id(current)
+        if identity in visited:
+            continue
+        visited.add(identity)
+
+        plain_dict = to_plain_dict(current)
+        if plain_dict:
+            prompt = plain_dict.get("prompt_tokens")
+            completion = plain_dict.get("completion_tokens")
+            total = plain_dict.get("total_tokens")
+
+            if any(item is not None for item in (prompt, completion, total)):
+                prompt_value = safe_int(prompt) if prompt is not None else 0
+                if prompt_value == 0:
+                    prompt_value = safe_int(plain_dict.get("input_tokens"))
+
+                if prompt_value == 0 and plain_dict.get("prompt_tokens_details"):
+                    details = to_plain_dict(plain_dict.get("prompt_tokens_details"))
+                    if details:
+                        prompt_value = sum(safe_int(val) for val in details.values())
+
+                completion_value = safe_int(completion) if completion is not None else 0
+                if completion_value == 0:
+                    completion_value = safe_int(plain_dict.get("output_tokens"))
+
+                if completion_value == 0 and plain_dict.get("completion_tokens_details"):
+                    details = to_plain_dict(plain_dict.get("completion_tokens_details"))
+                    if details:
+                        completion_value = sum(safe_int(val) for val in details.values())
+
+                total_value = safe_int(total) if total is not None else prompt_value + completion_value
+                if total_value == 0:
+                    total_value = prompt_value + completion_value
+
+                return {
+                    "prompt_tokens": prompt_value,
+                    "completion_tokens": completion_value,
+                    "total_tokens": total_value
+                }
+
+            for key in nested_keys:
+                nested_value = plain_dict.get(key)
+                if nested_value is not None:
+                    stack.append(nested_value)
+
+        for attr in nested_keys:
+            if hasattr(current, attr):
+                stack.append(getattr(current, attr))
+
+    return None
+
+
+def extract_usage_from_chunk(chunk: Any, event_data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, int]]:
+    """
+    提取流式 chunk 中的 usage 数据
+
+    :param chunk: LangChain chunk 对象或原始字典
+    :param event_data: 原始事件数据，作为兜底
+    :return:
+    """
+    usage = normalize_usage_payload(chunk)
+    if usage:
+        return usage
+
+    return normalize_usage_payload(event_data)
+
+
+def extract_usage_from_output(output: Any) -> Optional[Dict[str, int]]:
+    """
+    提取最终输出对象中的 usage 数据
+
+    :param output: LangGraph on_chat_model_end 的输出对象
+    :return:
+    """
+    return normalize_usage_payload(output)
 
 
 @app.get("/")
@@ -78,10 +287,22 @@ async def run_workflow(payload: Payload):
             # 发送初始思考事件
             yield format_tool_thinking("正在初始化工作流...", trace_id)
             
+            # 身份问答拦截
+            if is_identity_query(payload.input.messages):
+                logger.info("Identity query detected, returning canned response")
+                yield format_message_chunk(IDENTITY_RESPONSE, trace_id)
+                yield format_done(
+                    usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    finish_reason="identity_guard",
+                    trace_id=trace_id
+                )
+                return
+
             # 2. 构建 LLM
+            model_cfg = payload.runtime_config.model
             logger.info("Building LLM client")
             yield format_tool_thinking("正在连接模型服务...", trace_id)
-            llm = build_llm(payload.runtime_config.model)
+            llm = build_llm(model_cfg)
             
             # 3. 构建工具集
             logger.info(f"Loading {len(payload.runtime_config.tools)} tools")
@@ -138,6 +359,9 @@ async def run_workflow(payload: Payload):
                             content = ""
                             
                             if chunk is not None:
+                                usage_from_chunk = extract_usage_from_chunk(chunk, event_data)
+                                if usage_from_chunk:
+                                    usage_data.update(usage_from_chunk)
                                 # 处理不同类型的 chunk 对象
                                 if hasattr(chunk, "content"):
                                     # LangChain AIMessageChunk 对象
@@ -159,48 +383,14 @@ async def run_workflow(payload: Payload):
                                     accumulated_content += content
                                     # 实时输出 message_chunk 事件
                                     yield format_message_chunk(content, trace_id)
+                                
                         
                         # 处理 LLM 完成事件，提取 usage_metadata
                         elif event_name == "on_chat_model_end":
                             output = event_data.get("output")
-                            if output:
-                                usage_metadata = None
-                                
-                                # 方法1: 从 response_metadata 中提取
-                                if hasattr(output, "response_metadata"):
-                                    rm = output.response_metadata
-                                    if isinstance(rm, dict):
-                                        usage_metadata = rm.get("usage_metadata")
-                                    elif hasattr(rm, "get"):
-                                        usage_metadata = rm.get("usage_metadata")
-                                
-                                # 方法2: 如果 output 是字典，直接获取
-                                if not usage_metadata and isinstance(output, dict):
-                                    rm = output.get("response_metadata", {})
-                                    if isinstance(rm, dict):
-                                        usage_metadata = rm.get("usage_metadata")
-                                
-                                # 提取 usage 数据
-                                if usage_metadata:
-                                    if isinstance(usage_metadata, dict):
-                                        usage_data["prompt_tokens"] = usage_metadata.get("prompt_tokens", 0)
-                                        usage_data["completion_tokens"] = usage_metadata.get("completion_tokens", 0)
-                                        usage_data["total_tokens"] = usage_metadata.get("total_tokens", 0)
-                                    elif hasattr(usage_metadata, "prompt_tokens"):
-                                        # 如果是对象，尝试获取属性
-                                        usage_data["prompt_tokens"] = getattr(usage_metadata, "prompt_tokens", 0)
-                                        usage_data["completion_tokens"] = getattr(usage_metadata, "completion_tokens", 0)
-                                        usage_data["total_tokens"] = getattr(usage_metadata, "total_tokens", 0)
-                                
-                                # 如果仍然没有获取到，尝试从 output 的其他位置获取
-                                if usage_data["total_tokens"] == 0:
-                                    # 某些 LLM 可能将 usage 信息放在不同位置
-                                    if hasattr(output, "usage"):
-                                        usage_obj = output.usage
-                                        if isinstance(usage_obj, dict):
-                                            usage_data["prompt_tokens"] = usage_obj.get("prompt_tokens", 0)
-                                            usage_data["completion_tokens"] = usage_obj.get("completion_tokens", 0)
-                                            usage_data["total_tokens"] = usage_obj.get("total_tokens", 0)
+                            usage_from_output = extract_usage_from_output(output)
+                            if usage_from_output:
+                                usage_data.update(usage_from_output)
                         
                         # 处理工具调用开始事件
                         elif event_name == "on_tool_start":
