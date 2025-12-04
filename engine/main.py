@@ -354,7 +354,8 @@ async def run_workflow(payload: Payload):
                 graph = builder(
                     llm=llm,
                     tools=tools,
-                    tool_configs=payload.runtime_config.tools
+                    tool_configs=payload.runtime_config.tools,
+                    trace_id=trace_id,
                 )
 
                 init_state = {
