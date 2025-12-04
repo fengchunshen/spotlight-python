@@ -87,6 +87,10 @@ def _bind_llm_tools(
 def _convert_messages(messages: List[Dict[str, Any]]) -> List[Any]:
     """将内部消息结构转换为 LangChain 消息
 
+    支持多模态输入：
+    - 字符串格式：content = "text"
+    - 多模态格式：content = [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
+
     :param messages: 当前状态消息列表
     :return: LangChain 消息对象列表
     """
