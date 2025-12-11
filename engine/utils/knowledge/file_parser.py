@@ -171,10 +171,11 @@ async def _process_pdf(path: Path, params: dict[str, Any], trace_id: str | None)
     enable_ocr = params.get("enable_ocr")
     if enable_ocr and enable_ocr != "disable":
         logger.warning("当前未内置 OCR，PDF 将以文本方式解析")
-    reader = PdfReader(path)
     texts = []
-    for page in reader.pages:
-        texts.append(page.extract_text() or "")
+    with path.open("rb") as file_obj:
+        reader = PdfReader(file_obj)
+        for page in reader.pages:
+            texts.append(page.extract_text() or "")
     return "\n\n".join(texts).strip()
 
 

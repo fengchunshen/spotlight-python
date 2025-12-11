@@ -23,6 +23,7 @@ from engine.models.llm_factory import build_llm
 from engine.tools.loader import build_tools_from_runtime, ToolEventHooks
 from engine.workflows.registry import get_workflow_builder, list_workflows
 from engine.routers import knowledge as knowledge_router
+from engine.tests import pdf_test_router
 from engine.sse.emitter import (
     format_tool_thinking,
     format_tool_start,
@@ -42,6 +43,7 @@ app = FastAPI(
 )
 
 app.include_router(knowledge_router.router)
+app.include_router(pdf_test_router.router)
 
 
 
