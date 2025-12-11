@@ -6,8 +6,17 @@ orjson
 langchain-core
 langgraph
 langchain-openai
+langchain-text-splitters
+langchain-community
 httpx
+aiofiles
+pandas
+openpyxl
+markdownify
+python-docx
+pypdf
 
 python-dotenv
 loguru
+pymilvus
 
