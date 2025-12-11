@@ -53,3 +53,8 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
+# Project data
+saves/
+参考代码/
+tests/
+
